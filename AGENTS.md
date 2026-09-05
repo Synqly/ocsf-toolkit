@@ -37,8 +37,8 @@ Keep durable project context in the committed documentation:
 - `docs/engineering/project-invariants.md` records source-backed OCSF, compiled-schema, toolkit, and engineering invariants used to protect stable behavior.
 - `docs/engineering/project-decisions.md` records deliberate design choices and the derived requirements that should inform long-lived tests.
 - `docs/event-processing.md`, `docs/enrichment.md`, `docs/enrichment-removal.md`, and `docs/validation.md` describe language-neutral processing behavior for users and independent implementers.
+- `docs/ocsf-server-v2-validator-comparison.md` summarizes user-visible differences from the OCSF Server v2 validator.
 - `docs/roadmap.md` tracks active and future work.
-- `docs/ocsf-server-validation.md` retains historical validation-parity findings for OCSF Server; back-porting Toolkit behavior is not active work.
 - `docs/homebrew.md` records the planned Homebrew distribution approach.
 - `docs/release_process.md` documents the current release procedure.
 
@@ -52,9 +52,11 @@ Approach changes with senior engineering judgment. Consider the project's archit
 
 Read the surrounding implementation before proposing abstractions. Existing design, behavior, tests, and conventions are evidence of intent, not immutable constraints. Prefer existing project patterns and standard-library facilities when they remain sound, but do not preserve accidental complexity, weak abstractions, or incorrect behavior merely for consistency. When a material change improves correctness, simplicity, or maintainability, explain the tradeoff and deliberately update affected contracts, tests, and documentation. Add an abstraction only when it removes meaningful complexity or duplication.
 
-Keep the public API small and intentional. Public packages and exported identifiers require useful Go documentation. The principal public packages are `eventschema`, `jsonio`, and `jsonish`; implementation details should remain internal when library users do not need them.
+Keep the public API small and intentional. Public packages and exported identifiers require useful Go documentation. The principal public packages are `eventpipeline`, `jsonio`, and `jsonish`; implementation details should remain internal when library users do not need them.
 
 Use `jsonish.Map` for JSON objects in event-processing APIs. For JSON input, preserve numbers as `json.Number` when possible; the `jsonio` package provides the preferred decoding behavior. OCSF `integer_t` and `long_t` values are signed 64-bit integers.
+
+For event attributes stored in `jsonish.Map`, treat `item[key] == nil` as logically absent and prefer a direct lookup followed by a nil check. This does not apply to array elements: a nil array element is present and has an illegal OCSF type. Use comma-`ok` only when physical map membership matters, such as deleting a present nil-valued attribute during removal.
 
 Event enrichment intentionally mutates event maps in place and is not transactional. Preserve and document this behavior unless a change is explicitly requested. Validation must run after enrichment and any future event-mutating processors.
 
@@ -104,7 +106,7 @@ Treat performance and allocation ceilings as regression budgets, not targets to 
 
 Keep tests deterministic and local. Prefer clear interfaces, small fakes, and dependency injection over mocking frameworks. Avoid tests that merely restate a thin adapter's implementation.
 
-Validation changes should include boundary cases and, where applicable, parity checks against OCSF Server's `validator2.ex` behavior. Enrichment tests should verify both event mutations and processing results.
+Validation changes should include boundary cases and, where applicable, parity checks against the OCSF Server v2 validator implemented in `lib/schema/validator2.ex`. Enrichment tests should verify both event mutations and processing results.
 
 If relevant tests or verification cannot be run, explain why.
 
@@ -120,7 +122,7 @@ Do not edit generated files in `build/`, `dist/`, or coverage outputs. Regenerat
 
 ### Performance and memory verification
 
-Run `go test ./eventschema -run '^$' -bench '.' -benchmem -benchtime 500ms -count 10` for a current-checkout snapshot of runtime, transient bytes per operation, and allocations per operation. Run `scripts/benchmark-compare.sh` for the preferred regression analysis: it benchmarks the current checkout and the newest eligible release tag on the same machine with the same Go environment, then compares the samples with `benchstat`. Use `--base vX.Y.Z` to select a specific reachable release, `--pattern 'regexp'` to focus the suite, and `--count N` or `--time DURATION` only when the defaults do not provide enough statistical confidence.
+Run `go test ./eventpipeline -run '^$' -bench '.' -benchmem -benchtime 500ms -count 10` for a current-checkout snapshot of runtime, transient bytes per operation, and allocations per operation. Run `scripts/benchmark-compare.sh` for the preferred regression analysis: it benchmarks the current checkout and the newest eligible release tag on the same machine with the same Go environment, then compares the samples with `benchstat`. Use `--base vX.Y.Z` to select a specific reachable release, `--pattern 'regexp'` to focus the suite, and `--count N` or `--time DURATION` only when the defaults do not provide enough statistical confidence.
 
 Use the ordinary tests to enforce allocation ceilings; `make test` includes the representative `ProcessEvent` allocation budgets. Do not infer retained heap size from benchmark `B/op`. The dedicated `BenchmarkSchemaRetained` and `BenchmarkValidationMetadataRetained` benchmarks force garbage collection and report retained schema and validation-cache memory separately from transient construction allocations.
 

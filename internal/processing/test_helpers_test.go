@@ -31,17 +31,18 @@ func testPtrTo[T any](value T) *T {
 // EventProcessor is internal-test-only sugar: each NewXxx constructor below builds a PipelineConfig that only
 // touches the fields for its own concern (leaving the others at their zero/None value), and
 // mustNewEventProcessorPipeline merges the concerns from multiple EventProcessor values into the single
-// PipelineConfig that Schema.NewPipeline now expects, so existing tests composing validation/enrichment/removal
+// PipelineConfig that eventpipeline.NewPipeline now expects, so existing tests composing validation/enrichment/removal
 // did not need to be restructured when the public API moved to one resolved PipelineConfig per pipeline.
 type EventProcessor = PipelineConfig
 type ValidationOption func(*ValidationConfig)
 
 type enrichmentHelperConfig struct {
-	enumSiblingsAction     enrichment.Action
-	observablesAction      enrichment.Action
-	observableTypeIDs      []int64
-	pathNotation           pathstyle.Style
-	pathNotationConfigured bool
+	enumSiblingsAction      enrichment.Action
+	observablesAction       enrichment.Action
+	observableTypeIDs       []int64
+	observableDeduplication enrichment.ObservableDeduplication
+	pathNotation            pathstyle.Style
+	pathNotationConfigured  bool
 }
 
 type EnrichmentOption func(*enrichmentHelperConfig)
@@ -62,9 +63,9 @@ func NewValidation(options ...ValidationOption) EventProcessor {
 	}
 }
 
-func WithWarnOnMissingRecommended() ValidationOption {
+func WithValidationLevel(code validation.Code, level validation.Level) ValidationOption {
 	return func(config *ValidationConfig) {
-		config.WarnOnMissingRecommended = true
+		config.PolicyRules = append(config.PolicyRules, ValidationPolicyRule{Code: code, Level: level})
 	}
 }
 
@@ -91,9 +92,16 @@ func NewEnrichment(options ...EnrichmentOption) EventProcessor {
 		ObservablesAction:  config.observablesAction,
 		Observables: ObservablesConfig{
 			TypeIDs:                config.observableTypeIDs,
+			Deduplication:          config.observableDeduplication,
 			PathNotation:           config.pathNotation,
 			PathNotationConfigured: config.pathNotationConfigured,
 		},
+	}
+}
+
+func WithObservableDeduplication(mode enrichment.ObservableDeduplication) EnrichmentOption {
+	return func(config *enrichmentHelperConfig) {
+		config.observableDeduplication = mode
 	}
 }
 
@@ -167,7 +175,7 @@ func boolToAction(enabled bool, whenEnabled enrichment.Action) enrichment.Action
 }
 
 // mergeEventProcessors combines the concern-scoped EventProcessor values built by NewValidation, NewEnrichment,
-// and NewEnrichmentRemoval into the single PipelineConfig that Schema.NewPipeline expects. Each concern's fields
+// and NewEnrichmentRemoval into the single PipelineConfig that eventpipeline.NewPipeline expects. Each concern's fields
 // are only copied over when that concern's EventProcessor actually enabled it, so processors passed together
 // (for example enrichment plus validation) combine instead of overwriting each other.
 func mergeEventProcessors(processors []EventProcessor) PipelineConfig {
@@ -188,8 +196,8 @@ func mergeEventProcessors(processors []EventProcessor) PipelineConfig {
 			merged.ValidationEnabled = true
 			merged.Validation = processor.Validation
 		}
-		if processor.IssueSuppression.Configured {
-			merged.IssueSuppression = processor.IssueSuppression
+		if len(processor.IssuePolicy.LevelRules) != 0 {
+			merged.IssuePolicy = processor.IssuePolicy
 		}
 	}
 	return merged
@@ -197,15 +205,15 @@ func mergeEventProcessors(processors []EventProcessor) PipelineConfig {
 
 func mustNewEventProcessorPipeline(
 	assert *require.Assertions,
-	factory *PipelineFactory,
+	compiled *schema.Compiled,
 	processors ...EventProcessor,
-) *Pipeline {
-	pipeline, err := factory.NewPipeline(mergeEventProcessors(processors))
+) *PipelineImpl {
+	pipeline, err := NewPipelineImpl(compiled, mergeEventProcessors(processors))
 	assert.NoError(err)
 	return pipeline
 }
 
-func makeTestSchema(assert *require.Assertions) *PipelineFactory {
+func makeTestSchema(assert *require.Assertions) *schema.Compiled {
 	classNameAttribute := commonAttributeDefinition{
 		Type: "string_t",
 	}
@@ -354,10 +362,10 @@ func makeTestSchema(assert *require.Assertions) *PipelineFactory {
 	compiled, err := schema.New(sd)
 	assert.NoError(err)
 	assert.NotNil(compiled, "schema should not be nil")
-	return NewPipelineFactory(compiled)
+	return compiled
 }
 
-func makeValidationTestSchema(assert *require.Assertions) *PipelineFactory {
+func makeValidationTestSchema(assert *require.Assertions) *schema.Compiled {
 	classNameSibling := "class_name"
 	activityNameSibling := "activity_name"
 	modeSibling := "mode"
@@ -602,7 +610,7 @@ func makeValidationTestSchema(assert *require.Assertions) *PipelineFactory {
 		Version:        "1.0.0",
 	})
 	assert.NoError(err)
-	return NewPipelineFactory(compiled)
+	return compiled
 }
 
 func validValidationEvent() jsonish.Map {

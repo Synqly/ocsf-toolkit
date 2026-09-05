@@ -45,7 +45,7 @@ Schema compilation owns semantic schema validation, including reference integrit
 
 The top-level `class_uid` identifies the event class. Resolve it as a signed integral value and look up the corresponding compiled class definition before performing schema-guided processing.
 
-If `class_uid` is missing, malformed, or unknown, event processing stops because the event does not identify a valid OCSF class. Report a mandatory processing issue for this termination whether or not validation is enabled. Validation should additionally report the class problem when enabled; this finding cannot be suppressed, although reporting policy may change its effective level. No mutation is performed, including force removal and other operations that would not otherwise require the class schema. Requiring class resolution before any mutation provides a minimal sanity check that the input is shaped as an OCSF event rather than arbitrary structured data.
+If `class_uid` is missing, malformed, or unknown, event processing stops because the event does not identify a valid OCSF class. Report a mandatory processing issue for this termination whether or not validation is enabled. Validation should additionally report the class problem when enabled unless policy ignores that validation code. No mutation is performed, including force removal and other operations that would not otherwise require the class schema. Requiring class resolution before any mutation provides a minimal sanity check that the input is shaped as an OCSF event rather than arbitrary structured data.
 
 ## Profiles
 
@@ -57,11 +57,11 @@ The generic `object` object type is an open-ended OCSF object when used directly
 
 ## Missing And Null Values
 
-OCSF does not give a functional distinction to a missing attribute and an attribute with a null value. Treat both as absent for requirements, constraints, ordinary traversal, and unknown-attribute checks.
+OCSF has no logical null value. Treat an attribute represented without a value as absent for requirements, constraints, ordinary traversal, unknown-attribute checks, enrichment, removal, and observable resolution. In the Go API, a missing `jsonish.Map` key and a key whose value is `nil` both represent this logical absence.
 
-This rule does not make null a generally valid array element. OCSF attribute types do not define null array elements. Validation may therefore report a null element as an invalid value even though a null object attribute is treated as missing.
+This rule applies to map attributes, not array positions. An array position represented by a null or nil element remains an element, and validation reports it as invalid because OCSF attribute types do not define null array elements.
 
-Observable matching has an additional consequence: an observable whose explicit `value` is null can match either an explicit null or a missing branch at a schema-valid event path. See [Enrichment Removal](enrichment-removal.md#observable-matching) and [Validation](validation.md#observables).
+Processors do not distinguish missing and nil-valued map attributes in diagnostics or result counters. An enabled removal processor may delete a nil-valued attribute within its requested scope without counting a logical value as removed; other processors do not normalize the representation merely because the attribute has no logical value.
 
 ## Schema-Guided Walking
 
@@ -103,10 +103,10 @@ Processing is not inherently transactional. A mutating implementation may leave 
 
 Keep validation errors and warnings distinct from processing failures. An invalid OCSF event was successfully processed and produced validation results; an unusable schema, unsupported input representation, or internal failure prevented processing.
 
-Enrichment and enrichment removal should report non-fatal issues that explain why requested content was not added or safely removed. Counts should describe actual mutations and retained content, while directory or stream summaries may aggregate those results per event.
+Enrichment and enrichment removal should report issues that explain why requested content was not added or safely removed. Counts should describe actual mutations and retained content, while directory or stream summaries may aggregate those results per event. A duplicate-observable issue is detection rather than an explanation that content was skipped: duplicate reporting and generated-observable deduplication are independent controls.
 
-An implementation may let callers suppress selected tolerable processing issues when diagnostics are not needed. Suppression should avoid constructing paths, messages, and details for the omitted issues, but must not alter mutations, counters, validation results, or processing failures. Issues that disclose incomplete processing, including class-resolution failure and the recursive-object traversal limitation, remain mandatory.
+An implementation may let callers assign ignored, warning, or error levels to processing issue codes. Ignored handling should avoid constructing paths, messages, and details for omitted issues. Warning handling should collect the issue in the successful result. Error handling should stop at the first matching issue and return it through the processing-failure channel rather than returning a meaningful partial result. Level policy must not change the mutation that led to an issue, and an event may therefore be partially mutated when an error-level issue stops processing. When the same duplicate condition has both an issue and a validation representation, an implementation may designate the enabled issue as the sole diagnostic owner to avoid scanning and reporting twice. Issues that disclose incomplete processing, including class-resolution failure and the recursive-object traversal limitation, remain mandatory and cannot be ignored.
 
 ## Reference Implementation
 
-`internal/processing` is a fully functioning, tested example of this model: `process.go` implements schema-guided walking and the recursive-object boundary, and `pipeline.go` and `config.go` implement operation ordering. `issue.IssueCode` (`issue/code.go`) lists every processing issue this implementation can produce. Read the code directly for anything this guide leaves out. The public API and internal design built on top of this model are described in [architecture.md](architecture.md), not here.
+`internal/processing` is a fully functioning, tested example of this model: `process.go` implements schema-guided walking and the recursive-object boundary, and `pipeline.go` and `config.go` implement operation ordering. `issue.Code` (`issue/code.go`) lists every processing issue this implementation can produce. Read the code directly for anything this guide leaves out. The public API and internal design built on top of this model are described in [Architecture](architecture.md), not here.

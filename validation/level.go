@@ -7,6 +7,8 @@ type Level uint8
 
 const (
 	invalidLevel Level = iota
+	// LevelIgnored omits an ignorable validation finding under the active policy.
+	LevelIgnored
 	// LevelWarning reports a condition that should be reviewed but does not fail validation under the active policy.
 	LevelWarning
 	// LevelError reports a condition that fails validation under the active policy.
@@ -15,6 +17,7 @@ const (
 )
 
 var levelInfos = [levelCount]coderegistry.Info{
+	LevelIgnored: {Name: "ignored"},
 	LevelWarning: {Name: "warning"},
 	LevelError:   {Name: "error"},
 }

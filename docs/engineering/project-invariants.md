@@ -20,7 +20,7 @@ Authority depends on the kind of claim being evaluated:
 2. The OCSF Schema Compiler format contract, source, and tests are authoritative for the normal compiled-schema representation that this toolkit consumes. Compiler behavior does not independently redefine event semantics.
 3. The OCSF schema `CHANGELOG.md`, repository history, and linked merged decisions establish when schema concepts or definitions were introduced, changed, or corrected.
 4. Explicit maintainer decisions and the toolkit's public contracts establish toolkit-specific behavior where OCSF leaves implementation choices open.
-5. Prior working implementations, including `ocsf-translator-go`, `ses-translator`, OCSF Server `validator2.ex`, and relevant OCSF Java tooling, are historical and implementation evidence. Common ancestry reduces their independence, and disagreement with an authoritative source may expose a defect in the prior implementation.
+5. Prior working implementations, including `ocsf-translator-go`, `ses-translator`, the OCSF Server v2 validator in `lib/schema/validator2.ex`, and relevant OCSF Java tooling, are historical and implementation evidence. Common ancestry reduces their independence, and disagreement with an authoritative source may expose a defect in the prior implementation.
 6. Released toolkit behavior, protected tests, fixtures, and the local event corpus are compatibility and reproduction evidence. A test protects an invariant only when the requirement it expresses has independent authority.
 7. `ocsf/ocsf-docs` is explanatory evidence intended for humans. It is useful for discovering intent and examples but may be vague, inaccurate, or stale; verify consequential claims against stronger sources.
 
@@ -134,7 +134,7 @@ Authority: `DECISION-ENUM-001`; concrete class and object definitions consumed b
 
 ### TOOLKIT-CLASS-001: failed class resolution stops before mutation
 
-If `class_uid` is missing, has the wrong type, or does not resolve a class, processing reports the mandatory class-resolution issue and stops before every mutation, including forced removal. Validation additionally reports its non-suppressible class finding when enabled.
+If `class_uid` is missing, has the wrong type, or does not resolve a class, processing reports the mandatory class-resolution issue and stops before every mutation, including forced removal. Validation additionally reports its class finding when enabled unless policy ignores that validation code. The validation finding is optional; the processing issue cannot be ignored.
 
 Authority: `docs/event-processing.md`, `docs/architecture.md`, the public processing contract, and explicit maintainer confirmation on 2026-08-22 that force removal must not run without `class_uid` resolution.
 
@@ -148,7 +148,7 @@ Authority: explicit maintainer decision on 2026-08-22; `AGENTS.md`; `docs/archit
 
 Class IDs, enum values, constraints, and other integral semantics accept a representation only when its mathematical value is finite, in signed-64-bit range, and exactly integral. Decimal or exponent spellings must not be rounded, truncated, underflowed, or overflowed into a different integer. JSON input should retain `json.Number` when possible.
 
-Authority: toolkit numeric contract; `eventschema/invariant_test.go`; `TestInvariantScalarConversionsPreserveEquivalentValues`; and `TestInvariantValueConstraintsUseTypedEquality`.
+Authority: toolkit numeric contract; `eventpipeline/invariant_test.go`; `TestInvariantScalarConversionsPreserveEquivalentValues`; and `TestInvariantValueConstraintsUseTypedEquality`.
 
 ### TOOLKIT-STRING-001: `max_len` counts Unicode code points
 
@@ -158,9 +158,9 @@ Authority: explicit maintainer decision on 2026-08-22; `docs/validation.md`; `do
 
 ### TOOLKIT-NULL-001: missing and null object attributes are equivalent
 
-For requirements, constraints, ordinary traversal, and unknown-attribute checks, a missing attribute and an explicit null object attribute are absent. Null array elements remain values and are invalid because OCSF array element types do not include null. Observable `value` has separate omission-versus-null semantics.
+OCSF has no logical null value. A missing event-map key and a key represented without a value are the same absent attribute for validation, enrichment, removal, observable resolution, diagnostics, and result counting. Observable `value` has no exception: omitted and nil-valued map entries both denote a valueless object observable. Array positions represented without a value remain elements and are invalid because OCSF array element types do not include null. A removal processor may delete a nil-valued map entry within its configured scope without counting a logical value as removed; other processors do not normalize it.
 
-Authority: `docs/event-processing.md`, `docs/architecture.md`, and public processing behavior.
+Authority: explicit maintainer decision on 2026-09-04; `docs/event-processing.md`; `docs/architecture.md`; public processing behavior.
 
 ### TOOLKIT-JSON-001: object decoders require one non-null object
 
@@ -212,9 +212,15 @@ Authority: `README.md`, `docs/enrichment.md`, `docs/architecture.md`, and public
 
 ### TOOLKIT-OBS-003: generated observables merge without replacing existing entries
 
-Observable enrichment preserves every existing entry and appends generated entries in deterministic traversal order after suppressing generated duplicates. Duplicate identity uses the exact observable name, integral-equivalent `type_id`, and the distinction among omitted, null, and exact string values; derived type captions and unrelated fields do not affect identity. Existing duplicates are preserved, while each suppressed generated duplicate is reported and excluded from the added count.
+Observable enrichment preserves every existing entry and appends generated entries in deterministic traversal order. Deduplication is disabled by default. Generated mode silently suppresses only a later generated candidate that duplicates an earlier generated candidate; it never scans, suppresses, or removes an existing entry, and a generated candidate matching only an existing entry is retained. Duplicate identity uses the exact observable name, integral-equivalent `type_id`, and optional exact string value; omitted and nil-valued map entries both represent no logical value. Derived type captions and unrelated fields do not affect identity. A suppressed generated candidate is excluded from the added count.
 
-Authority: `docs/enrichment.md`, `docs/architecture.md`, and public observable enrichment behavior.
+Authority: explicit maintainer confirmation on 2026-09-04, `docs/enrichment.md`, `docs/architecture.md`, and public observable enrichment behavior.
+
+### TOOLKIT-OBS-004: duplicate diagnostics are independent and avoid duplicate ownership
+
+The default-ignored observable duplicate issue detects existing-existing, generated-existing, and generated-generated identity collisions during observable addition independently of generated deduplication. The default-ignored observable duplicate validation detects collisions in the final observable array. If both are enabled during observable addition, the issue is the sole diagnostic owner so the same condition is neither scanned nor reported twice. Generated deduplication itself emits no issue or validation finding.
+
+Authority: explicit maintainer confirmation on 2026-09-04, `docs/enrichment.md`, `docs/validation.md`, and public issue and validation code contracts.
 
 ### TOOLKIT-RESULT-001: findings are data and processing failures are errors
 
@@ -230,7 +236,7 @@ Authority: `docs/architecture.md`, `docs/validation.md`, and the documented secu
 
 ### TOOLKIT-CODE-001: diagnostic codes are typed machine-readable identities
 
-Processing issues and validation findings carry typed codes with stable string encodings distinct from human-readable messages. Processing issue strings use the `issue_` namespace. Validation code strings use the `validation_` namespace, while effective warning or error level is separate policy rather than part of code identity. Renaming or removing an existing code is an observable contract change even when it is deliberately permitted before 1.0.
+Processing issues and validation findings carry typed codes with stable string encodings distinct from human-readable messages. Processing issue strings use the `issue_` namespace. Validation code strings use the `validation_` namespace, while effective warning or error level is separate policy rather than part of code identity. Within a stable major version, exported code names and ordinals, string encodings, default levels, and ignorable or mandatory classifications remain stable. A code that stops being emitted remains exported at its existing ordinal and is marked deprecated for the rest of that major version. New codes append rather than shifting existing ordinals. Human-readable descriptions may be clarified without changing code identity.
 
 Authority: `README.md`, `docs/architecture.md`, `docs/validation.md`, and the public `issue` and `validation` packages.
 

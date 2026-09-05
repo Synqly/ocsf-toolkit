@@ -11,6 +11,7 @@ import (
 	"github.com/ocsf/ocsf-toolkit/eventresult"
 	"github.com/ocsf/ocsf-toolkit/internal/eventpath"
 	"github.com/ocsf/ocsf-toolkit/internal/eventvalue"
+	"github.com/ocsf/ocsf-toolkit/internal/observable"
 	"github.com/ocsf/ocsf-toolkit/internal/schema"
 	"github.com/ocsf/ocsf-toolkit/issue"
 	"github.com/ocsf/ocsf-toolkit/jsonish"
@@ -18,9 +19,11 @@ import (
 )
 
 var errNilEvent = errors.New("event is nil")
-var errUninitializedSchema = errors.New("schema is not initialized; create it with eventschema.Load")
-var errUninitializedPipeline = errors.New(
-	"event processor pipeline is not initialized; create it with Schema.NewPipeline",
+var errUninitializedSchema = errors.New("schema is not initialized; create it with eventpipeline.NewSchema")
+
+// ErrUninitializedPipeline is shared with the public facade so every uninitialized pipeline state returns one error.
+var ErrUninitializedPipeline = errors.New(
+	"event processor pipeline is not initialized; create it with eventpipeline.NewPipeline",
 )
 
 type enumLookupStatus uint8
@@ -32,22 +35,21 @@ const (
 )
 
 type processContext struct {
-	compiled *schema.Compiled
-	pipeline *Pipeline
-	result   Result
+	compiled     *schema.Compiled
+	pipelineImpl *PipelineImpl
+	result       Result
 
 	class               *schema.ClassDefinition
 	activeProfiles      schema.ProfileSet
 	classObservableTrie *classObservableTrie
 	observables         []jsonish.Map
-	// observableDiagnosticPaths is allocated only when the configured observable notation omits concrete array
-	// indexes. Non-empty entries retain the canonical indexed source path for diagnostics.
-	observableDiagnosticPaths []string
-	// generatedObservablesStart identifies a suffix appended by this processing pass and therefore semantically
-	// valid by construction. A negative value means no trusted suffix exists. Existing observables retain their
-	// original order.
-	generatedObservablesStart        int
-	generatedObservablesPathNotation pathstyle.Style
+	// generatedObservableIdentities is used only for generated-only deduplication without duplicate diagnostics. It
+	// lets generation reject duplicates before constructing their maps.
+	generatedObservableIdentities observable.GeneratedIdentitySet
+	observableDiagnostics         *observableDiagnosticState
+	// generatedObservablesFirstIndex is the array index of the first trusted generated observable in the final
+	// observable array. A negative value means no trusted generated suffix exists.
+	generatedObservablesFirstIndex   int
 	processingTraversalLimitReported bool
 	path                             eventpath.Path
 	// jsonNumberStyleKnown and jsonNumberUsesFloatSyntax record whether the first numeric enum json.Number seen in
@@ -57,40 +59,53 @@ type processContext struct {
 	jsonNumberUsesFloatSyntax bool
 }
 
-// Result is the internal mutable result accumulated while processing an event. The public eventschema result wraps
+type observableDiagnosticState struct {
+	// generatedIndexedPaths is a sparse cache of concrete indexed paths for generated candidates whose configured
+	// names omit array indexes. Duplicate issues use it after traversal has moved the mutable path cursor.
+	generatedIndexedPaths []string
+}
+
+// Result is the internal mutable result accumulated while processing an event. The public eventpipeline result wraps
 // these values in an opaque concrete value after traversal completes.
 type Result struct {
 	Validation        eventresult.ValidationResult
 	Enrichment        eventresult.EnrichmentResult
 	EnrichmentRemoval eventresult.EnrichmentRemovalResult
 	Issues            []eventresult.ProcessingIssue
-	SuppressedIssues  int
 }
 
-// addProcessorIssue appends a diagnostic that its caller has already decided to report. Callers must apply any
-// applicable issue suppression before constructing the diagnostic so suppressed paths avoid rendering paths, formatting
-// messages, and allocating detail maps. This final append intentionally does not repeat the suppression check.
+// addProcessorIssue applies issue-level policy and reports a diagnostic unless its effective level is ignored. It
+// returns the issue when its effective level is error. Callers must return that error immediately; ProcessEvent then
+// discards the accumulated result.
 func (c *processContext) addProcessorIssue(
 	source issue.Source,
-	code issue.IssueCode,
+	code issue.Code,
 	details jsonish.Map,
 	message string,
-) {
-	issue := eventresult.ProcessingIssue{
+) error {
+	level := c.issueLevel(code)
+	if level == issue.LevelIgnored {
+		return nil
+	}
+	found := eventresult.ProcessingIssue{
 		Source:  source,
 		Code:    code,
 		Message: sanitizeDiagnosticMessage(message),
 		Details: details,
 	}
-	c.result.Issues = append(c.result.Issues, issue)
+	if level == issue.LevelError {
+		return &processingIssueError{issue: found}
+	}
+	c.result.Issues = append(c.result.Issues, found)
+	return nil
 }
 
-func (c *processContext) suppressesIssue(suppression issueSuppression, code issue.IssueCode) bool {
-	if !suppression.suppresses(code) {
-		return false
-	}
-	c.result.SuppressedIssues++
-	return true
+func (c *processContext) issueLevel(code issue.Code) issue.Level {
+	return effectiveIssueLevel(c.pipelineImpl.issuePolicy, code)
+}
+
+func (c *processContext) ignoresIssue(mask uint64) bool {
+	return c.pipelineImpl.issuePolicy.isIgnored(mask)
 }
 
 func lookupEnumDefinition(
@@ -199,26 +214,26 @@ const (
 // processors are enabled, the event may be partially modified if ProcessEvent returns an error.
 // Callers that need to preserve the original event should deep-copy it before processing.
 //
-// Invalid events are reported in the returned Result. The public eventschema pipeline exposes it as an opaque
-// eventschema.ProcessingResult. The error return is for an
+// Invalid events are reported in the returned Result. The public eventpipeline pipeline exposes it as an opaque
+// eventpipeline.ProcessingResult. The error return is for an
 // uninitialized pipeline, processor failures, or unusable caller input, not OCSF validation
 // failures. Results and errors do not repeat event values in diagnostic text or details.
-func (p *Pipeline) ProcessEvent(event jsonish.Map) (Result, error) {
+func (p *PipelineImpl) ProcessEvent(event jsonish.Map) (Result, error) {
 	if p == nil || p.compiled == nil {
-		return Result{}, errUninitializedPipeline
+		return Result{}, ErrUninitializedPipeline
 	}
 	if event == nil {
 		return Result{}, errNilEvent
 	}
 	context := processContext{
-		compiled:                  p.compiled,
-		pipeline:                  p,
-		generatedObservablesStart: -1,
+		compiled:                       p.compiled,
+		pipelineImpl:                   p,
+		generatedObservablesFirstIndex: -1,
 	}
 
 	classResolved, err := context.resolveClass(event)
 	if err != nil {
-		return context.result, err
+		return Result{}, err
 	}
 	if !classResolved {
 		return context.result, nil
@@ -227,7 +242,7 @@ func (p *Pipeline) ProcessEvent(event jsonish.Map) (Result, error) {
 	context.activeProfiles = schema.EventProfileSet(event)
 	for _, processor := range p.mutations {
 		if err := processor.onClass(&context, event); err != nil {
-			return context.result, err
+			return Result{}, err
 		}
 	}
 	if p.validation != nil {
@@ -236,14 +251,14 @@ func (p *Pipeline) ProcessEvent(event jsonish.Map) (Result, error) {
 
 	if p.requiresEventWalk {
 		if err := context.visitItem(event, &context.class.ItemDefinition); err != nil {
-			return context.result, err
+			return Result{}, err
 		}
 		if err := context.visitClassDone(event, &context.class.ItemDefinition); err != nil {
-			return context.result, err
+			return Result{}, err
 		}
 	}
 	if err := context.visitEventDone(event); err != nil {
-		return context.result, err
+		return Result{}, err
 	}
 
 	return context.result, nil
@@ -253,37 +268,43 @@ func (c *processContext) resolveClass(event jsonish.Map) (bool, error) {
 	class, _, status := c.compiled.ResolveEventClass(event)
 	switch status {
 	case schema.ClassUIDMissing:
-		if c.pipeline.validation != nil {
-			c.pipeline.validation.onClassUIDMissing(c)
-		}
-		c.addProcessorIssue(
+		if err := c.addProcessorIssue(
 			issue.SourceProcessing,
 			issue.ClassUIDMissing,
 			jsonish.Map{"attribute_path": "class_uid", "attribute": "class_uid"},
 			`The "class_uid" attribute is missing, preventing further event processing.`,
-		)
+		); err != nil {
+			return false, err
+		}
+		if c.pipelineImpl.validation != nil {
+			c.pipelineImpl.validation.onClassUIDMissing(c)
+		}
 		return false, nil
 	case schema.ClassUIDWrongType:
-		if c.pipeline.validation != nil {
-			c.pipeline.validation.onClassUIDWrongType(c, event["class_uid"])
-		}
-		c.addProcessorIssue(
+		if err := c.addProcessorIssue(
 			issue.SourceProcessing,
 			issue.ClassUIDWrongType,
 			jsonish.Map{"attribute_path": "class_uid", "attribute": "class_uid"},
 			`The "class_uid" attribute has the wrong type, preventing further event processing.`,
-		)
+		); err != nil {
+			return false, err
+		}
+		if c.pipelineImpl.validation != nil {
+			c.pipelineImpl.validation.onClassUIDWrongType(c, event["class_uid"])
+		}
 		return false, nil
 	case schema.ClassUIDUnknown:
-		if c.pipeline.validation != nil {
-			c.pipeline.validation.onClassUIDUnknown(c)
-		}
-		c.addProcessorIssue(
+		if err := c.addProcessorIssue(
 			issue.SourceProcessing,
 			issue.ClassUIDUnknown,
 			jsonish.Map{"attribute_path": "class_uid", "attribute": "class_uid"},
 			`The "class_uid" value does not identify a class in the schema, preventing further event processing.`,
-		)
+		); err != nil {
+			return false, err
+		}
+		if c.pipelineImpl.validation != nil {
+			c.pipelineImpl.validation.onClassUIDUnknown(c)
+		}
 		return false, nil
 	case schema.ClassResolved:
 		c.class = class
@@ -297,7 +318,7 @@ func (c *processContext) visitClassDone(
 	item jsonish.Map,
 	itemDefinition *schema.ItemDefinition,
 ) error {
-	for _, processor := range c.pipeline.mutations {
+	for _, processor := range c.pipelineImpl.mutations {
 		if err := processor.onClassDone(c, item, itemDefinition); err != nil {
 			return err
 		}
@@ -311,11 +332,11 @@ func (c *processContext) visitObject(
 	attrDef *schema.ItemAttributeDefinition,
 	objectDef *schema.ObjectDefinition,
 ) {
-	for _, processor := range c.pipeline.mutations {
+	for _, processor := range c.pipelineImpl.mutations {
 		processor.onObject(c, attributeName, attrDef, objectDef)
 	}
-	if c.pipeline.validation != nil {
-		c.pipeline.validation.onObject(c, attributeName, objectDef)
+	if c.pipelineImpl.validation != nil {
+		c.pipelineImpl.validation.onObject(c, attributeName, objectDef)
 	}
 }
 
@@ -323,13 +344,16 @@ func (c *processContext) visitObjectWrongType(
 	value any,
 	attributeName string,
 	attrDef *schema.ItemAttributeDefinition,
-) {
-	for _, processor := range c.pipeline.mutations {
-		processor.onObjectWrongType(c, attributeName, attrDef)
+) error {
+	for _, processor := range c.pipelineImpl.mutations {
+		if err := processor.onObjectWrongType(c, attributeName, attrDef); err != nil {
+			return err
+		}
 	}
-	if c.pipeline.validation != nil {
-		c.pipeline.validation.onObjectWrongType(c, value, attributeName, attrDef)
+	if c.pipelineImpl.validation != nil {
+		c.pipelineImpl.validation.onObjectWrongType(c, value, attributeName, attrDef)
 	}
+	return nil
 }
 
 func (c *processContext) visitObjectDone(
@@ -337,22 +361,22 @@ func (c *processContext) visitObjectDone(
 	objectDefinition *schema.ObjectDefinition,
 	objectType string,
 ) {
-	if c.pipeline.validation != nil {
+	if c.pipelineImpl.validation != nil {
 		if objectType != "object" {
 			c.visitUnknownAttributes(item, &objectDefinition.ItemDefinition)
 		}
-		c.pipeline.validation.onObjectDone(c, item, objectDefinition)
+		c.pipelineImpl.validation.onObjectDone(c, item, objectDefinition)
 	}
 }
 
 func (c *processContext) visitEventDone(event jsonish.Map) error {
-	for _, processor := range c.pipeline.mutations {
+	for _, processor := range c.pipelineImpl.mutations {
 		if err := processor.onEventDone(c, event); err != nil {
 			return err
 		}
 	}
-	if c.pipeline.validation != nil {
-		return c.pipeline.validation.onEventDone(c, event)
+	if c.pipelineImpl.validation != nil {
+		return c.pipelineImpl.validation.onEventDone(c, event)
 	}
 	return nil
 }
@@ -368,13 +392,15 @@ func (c *processContext) visitItem(
 		attributeName := attribute.Name
 		attrDef := attribute.Definition
 		if !schema.AttributeActive(attrDef, c.activeProfiles) {
-			value, present := eventvalue.Attribute(item, attributeName)
-			if present && c.pipeline.validation != nil {
+			value := item[attributeName]
+			if value != nil && c.pipelineImpl.validation != nil {
 				if attrDef == nil {
-					c.pipeline.validation.onUnknownAttribute(c, attributeName, itemDefinition)
+					c.pipelineImpl.validation.onUnknownAttribute(c, attributeName, itemDefinition)
 				} else {
 					c.path.PushAttribute(attributeName)
-					c.pipeline.validation.onInactiveAttribute(c, item, value, attributeName, attrDef, itemDefinition)
+					c.pipelineImpl.validation.onInactiveAttribute(
+						c, item, value, attributeName, attrDef, itemDefinition,
+					)
 					c.path.Pop()
 				}
 			}
@@ -392,10 +418,10 @@ func (c *processContext) visitItem(
 			}
 			continue
 		}
-		value, present := eventvalue.Attribute(item, attributeName)
+		value := item[attributeName]
 		c.path.PushAttribute(attributeName)
 
-		if !present {
+		if value == nil {
 			if err := c.visitAttribute(item, nil, attributeName, attrDef, -1, attributeMissing); err != nil {
 				return err
 			}
@@ -420,15 +446,15 @@ func (c *processContext) visitEnumSiblingPairAttributes(
 	siblingAttrDef := enumAttrDef.ResolvedEnumSibling
 	siblingAttributeName := *enumAttrDef.Sibling
 
-	for _, processor := range c.pipeline.mutations {
+	for _, processor := range c.pipelineImpl.mutations {
 		if err := processor.onEnumSiblingPairAttributes(
 			c, item, enumAttributeName, enumAttrDef, siblingAttributeName, siblingAttrDef,
 		); err != nil {
 			return err
 		}
 	}
-	if c.pipeline.validation != nil {
-		return c.pipeline.validation.onEnumSiblingPairAttributes(
+	if c.pipelineImpl.validation != nil {
+		return c.pipelineImpl.validation.onEnumSiblingPairAttributes(
 			c, item, enumAttributeName, enumAttrDef, siblingAttributeName, siblingAttrDef,
 		)
 	}
@@ -450,11 +476,13 @@ func (c *processContext) visitAttribute(
 		return fmt.Errorf("present attribute %q has no definition", attributeName)
 	}
 
-	for _, processor := range c.pipeline.mutations {
-		processor.onAttribute(c, item, value, attributeName, attrDef, arrayIndex, status)
+	for _, processor := range c.pipelineImpl.mutations {
+		if err := processor.onAttribute(c, item, value, attributeName, attrDef, arrayIndex, status); err != nil {
+			return err
+		}
 	}
-	if c.pipeline.validation != nil {
-		c.pipeline.validation.onAttribute(c, item, value, attributeName, attrDef, arrayIndex, status)
+	if c.pipelineImpl.validation != nil {
+		c.pipelineImpl.validation.onAttribute(c, item, value, attributeName, attrDef, arrayIndex, status)
 	}
 	if status != attributePresent {
 		return nil
@@ -508,20 +536,28 @@ func (c *processContext) visitScalarArrayValue(
 	arrayIndex int,
 ) error {
 	if attrDef.Enum != nil {
-		for _, processor := range c.pipeline.mutations {
-			processor.onArrayElement(c, values, arrayIndex, attributeName, attrDef, attributeEnum)
+		for _, processor := range c.pipelineImpl.mutations {
+			if err := processor.onArrayElement(
+				c, values, arrayIndex, attributeName, attrDef, attributeEnum,
+			); err != nil {
+				return err
+			}
 		}
-		if c.pipeline.validation != nil {
-			c.pipeline.validation.validateArrayEnum(
+		if c.pipelineImpl.validation != nil {
+			c.pipelineImpl.validation.validateArrayEnum(
 				c, containingItem, values, arrayIndex, attributeName, attrDef,
 			)
 		}
 	}
-	for _, processor := range c.pipeline.mutations {
-		processor.onArrayElement(c, values, arrayIndex, attributeName, attrDef, attributePrimitive)
+	for _, processor := range c.pipelineImpl.mutations {
+		if err := processor.onArrayElement(
+			c, values, arrayIndex, attributeName, attrDef, attributePrimitive,
+		); err != nil {
+			return err
+		}
 	}
-	if c.pipeline.validation != nil {
-		c.pipeline.validation.validateArrayPrimitiveValue(
+	if c.pipelineImpl.validation != nil {
+		c.pipelineImpl.validation.validateArrayPrimitiveValue(
 			c, values, arrayIndex, attributeName, attrDef, &c.path,
 		)
 	}
@@ -557,8 +593,7 @@ func (c *processContext) visitObjectValue(
 ) error {
 	objectValue, ok := value.(jsonish.Map)
 	if !ok {
-		c.visitObjectWrongType(value, attributeName, attrDef)
-		return nil
+		return c.visitObjectWrongType(value, attributeName, attrDef)
 	}
 
 	if attrDef.ObjectType == nil {
@@ -566,8 +601,8 @@ func (c *processContext) visitObjectValue(
 	}
 	objectDef := attrDef.ResolvedObject
 	if objectDef == nil {
-		if c.pipeline.validation != nil {
-			c.pipeline.validation.onObjectSchemaMissing(c, attributeName, *attrDef.ObjectType)
+		if c.pipelineImpl.validation != nil {
+			c.pipelineImpl.validation.onObjectSchemaMissing(c, attributeName, *attrDef.ObjectType)
 		}
 		return nil
 	}
@@ -577,8 +612,7 @@ func (c *processContext) visitObjectValue(
 	// repeats of this object's attribute name on the event path.
 	if c.path.HasPriorAttribute(attributeName) {
 		attributePath := c.path.String(pathstyle.ArrayIndexed)
-		c.addProcessingTraversalLimitIssue(attributePath, attributeName, *attrDef.ObjectType)
-		return nil
+		return c.addProcessingTraversalLimitIssue(attributePath, attributeName, *attrDef.ObjectType)
 	}
 
 	c.visitObject(attributeName, attrDef, objectDef)
@@ -590,7 +624,8 @@ func (c *processContext) visitObjectValue(
 }
 
 func (c *processContext) visitUnknownAttributes(item jsonish.Map, itemDefinition *schema.ItemDefinition) {
-	if c.pipeline.validation == nil {
+	if c.pipelineImpl.validation == nil ||
+		c.pipelineImpl.validation.policy.isIgnored(validationAttributeUnknownMask) {
 		return
 	}
 	var attributeNames []string
@@ -605,20 +640,20 @@ func (c *processContext) visitUnknownAttributes(item jsonish.Map, itemDefinition
 	}
 	sort.Strings(attributeNames)
 	for _, attributeName := range attributeNames {
-		c.pipeline.validation.onUnknownAttribute(c, attributeName, itemDefinition)
+		c.pipelineImpl.validation.onUnknownAttribute(c, attributeName, itemDefinition)
 	}
 }
 
-func (c *processContext) addProcessingTraversalLimitIssue(attributePath, attribute, objectType string) {
+func (c *processContext) addProcessingTraversalLimitIssue(attributePath, attribute, objectType string) error {
 	if c.processingTraversalLimitReported {
-		return
+		return nil
 	}
 	c.processingTraversalLimitReported = true
 	details := jsonish.Map{"attribute_path": attributePath, "attribute": attribute}
 	if objectType != "" {
 		details["object_type"] = objectType
 	}
-	c.addProcessorIssue(
+	return c.addProcessorIssue(
 		issue.SourceProcessing,
 		issue.EventTraversalLimited,
 		details,

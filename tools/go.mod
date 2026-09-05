@@ -1,10 +1,10 @@
 module github.com/ocsf/ocsf-toolkit/tools
 
-go 1.27.0
+go 1.27
 
 require (
 	github.com/aclements/go-moremath v0.0.0-20210112150236-f10218a38794 // indirect
-	golang.org/x/perf v0.0.0-20260819171926-ebcb4798430d // indirect
+	golang.org/x/perf v0.0.0-20260825160852-19be9d8e6c70 // indirect
 )
 
 tool golang.org/x/perf/cmd/benchstat

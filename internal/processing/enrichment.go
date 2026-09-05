@@ -14,18 +14,22 @@ import (
 )
 
 type enrichmentProcessor struct {
-	enumSiblingsEnabled  bool
-	observablesEnabled   bool
-	pathNotation         pathstyle.Style
-	observableTypes      observableTypeSelector
-	classObservableTries map[int64]*classObservableTrie
-	objectObservability  observable.ObjectObservability
-	issueSuppression     issueSuppression
+	enumSiblingsEnabled        bool
+	observablesEnabled         bool
+	deduplicateGenerated       bool
+	reportObservableDuplicates bool
+	pathNotation               pathstyle.Style
+	observableTypes            observableTypeSelector
+	classObservableTries       map[int64]*classObservableTrie
+	objectObservability        observable.ObjectObservability
 }
 
 func (p *enrichmentProcessor) onClass(context *processContext) {
 	if p.classObservableTries != nil {
 		context.classObservableTrie = p.classObservableTries[context.class.Uid]
+	}
+	if !p.observablesEnabled {
+		return
 	}
 }
 
@@ -42,10 +46,14 @@ func (p *enrichmentProcessor) onObject(
 		if p.observableTypes.allows(*objectDef.Observable) {
 			context.addObservable(
 				&context.path, *objectDef.Observable, nil, p.pathNotation, p.enumSiblingsEnabled,
+				p.deduplicateGenerated, p.reportObservableDuplicates,
 			)
 		}
 	} else if typeID, present := p.observableTypeID(context, attributeName, attrDef); present {
-		context.addObservable(&context.path, typeID, nil, p.pathNotation, p.enumSiblingsEnabled)
+		context.addObservable(
+			&context.path, typeID, nil, p.pathNotation, p.enumSiblingsEnabled,
+			p.deduplicateGenerated, p.reportObservableDuplicates,
+		)
 	}
 }
 
@@ -53,13 +61,13 @@ func (p *enrichmentProcessor) onObjectWrongType(
 	context *processContext,
 	attributeName string,
 	attrDef *schema.ItemAttributeDefinition,
-) {
+) error {
 	if !p.observablesEnabled || !p.attributeMayGenerate(context, attributeName, attrDef) {
-		return
+		return nil
 	}
-	if !context.suppressesIssue(p.issueSuppression, issue.EnrichmentObservableNotAddedWrongType) {
+	if !context.ignoresIssue(issueEnrichmentObservableNotAddedWrongTypeMask) {
 		attributePath := context.path.String(pathstyle.ArrayIndexed)
-		context.addProcessorIssue(
+		return context.addProcessorIssue(
 			issue.SourceEnrichment,
 			issue.EnrichmentObservableNotAddedWrongType,
 			jsonish.Map{
@@ -69,6 +77,7 @@ func (p *enrichmentProcessor) onObjectWrongType(
 			"Observable was not added for "+strconv.Quote(attributePath)+" because its value is not an object.",
 		)
 	}
+	return nil
 }
 
 func (p *enrichmentProcessor) onAttribute(
@@ -79,18 +88,17 @@ func (p *enrichmentProcessor) onAttribute(
 	attrDef *schema.ItemAttributeDefinition,
 	arrayIndex int,
 	status attributeState,
-) {
+) error {
 	if status == attributeEnum {
-		p.addEnumSibling(context, item, value, attributeName, attrDef, arrayIndex)
-		return
+		return p.addEnumSibling(context, item, value, attributeName, attrDef, arrayIndex)
 	}
 	if status == attributeArrayWrongType && p.observablesEnabled {
 		_, primitiveObservable := p.observableTypeID(context, attributeName, attrDef)
 		objectObservable := attrDef.Type == "object_t" && p.attributeMayGenerate(context, attributeName, attrDef)
 		if primitiveObservable || objectObservable {
-			if !context.suppressesIssue(p.issueSuppression, issue.EnrichmentObservableNotAddedWrongType) {
+			if !context.ignoresIssue(issueEnrichmentObservableNotAddedWrongTypeMask) {
 				attributePath := context.path.String(pathstyle.ArrayIndexed)
-				context.addProcessorIssue(
+				return context.addProcessorIssue(
 					issue.SourceEnrichment,
 					issue.EnrichmentObservableNotAddedWrongType,
 					jsonish.Map{
@@ -101,12 +109,12 @@ func (p *enrichmentProcessor) onAttribute(
 				)
 			}
 		}
-		return
+		return nil
 	}
 	if status != attributePrimitive || attrDef.Enum != nil || !p.observablesEnabled {
-		return
+		return nil
 	}
-	p.addScalarValueObservable(context, attributeName, attrDef, value)
+	return p.addScalarValueObservable(context, attributeName, attrDef, value)
 }
 
 func (p *enrichmentProcessor) onArrayElement(
@@ -116,11 +124,11 @@ func (p *enrichmentProcessor) onArrayElement(
 	attributeName string,
 	attrDef *schema.ItemAttributeDefinition,
 	status attributeState,
-) {
+) error {
 	if status != attributePrimitive || attrDef.Enum != nil || !p.observablesEnabled {
-		return
+		return nil
 	}
-	p.addScalarValueObservable(context, attributeName, attrDef, values.At(index))
+	return p.addScalarValueObservable(context, attributeName, attrDef, values.At(index))
 }
 
 // onEnumSiblingPairAttributes handles an enum and its resolved string sibling of the same shape instead of
@@ -132,31 +140,39 @@ func (p *enrichmentProcessor) onEnumSiblingPairAttributes(
 	enumAttrDef *schema.ItemAttributeDefinition,
 	siblingAttributeName string,
 	siblingAttrDef *schema.ItemAttributeDefinition,
-) {
-	enumValue, enumPresent := eventvalue.Attribute(item, enumAttributeName)
-	if enumPresent {
+) error {
+	enumValue := item[enumAttributeName]
+	if enumValue != nil {
 		context.path.PushAttribute(enumAttributeName)
+		var err error
 		if enumAttrDef.IsArray != nil && *enumAttrDef.IsArray {
-			p.addEnumArraySibling(context, item, enumValue, enumAttributeName, enumAttrDef, siblingAttributeName)
+			err = p.addEnumArraySibling(
+				context, item, enumValue, enumAttributeName, enumAttrDef, siblingAttributeName,
+			)
 		} else {
-			p.addEnumSibling(context, item, enumValue, enumAttributeName, enumAttrDef, -1)
+			err = p.addEnumSibling(context, item, enumValue, enumAttributeName, enumAttrDef, -1)
 		}
 		context.path.Pop()
+		if err != nil {
+			return err
+		}
 	}
 	if !p.observablesEnabled {
-		return
+		return nil
 	}
-	siblingValue, siblingPresent := eventvalue.Attribute(item, siblingAttributeName)
-	if !siblingPresent {
-		return
+	siblingValue := item[siblingAttributeName]
+	if siblingValue == nil {
+		return nil
 	}
 	context.path.PushAttribute(siblingAttributeName)
+	var err error
 	if siblingAttrDef.IsArray != nil && *siblingAttrDef.IsArray {
-		p.addArrayValueObservables(context, siblingAttributeName, siblingAttrDef, siblingValue)
+		err = p.addArrayValueObservables(context, siblingAttributeName, siblingAttrDef, siblingValue)
 	} else {
-		p.addScalarValueObservable(context, siblingAttributeName, siblingAttrDef, siblingValue)
+		err = p.addScalarValueObservable(context, siblingAttributeName, siblingAttrDef, siblingValue)
 	}
 	context.path.Pop()
+	return err
 }
 
 func (p *enrichmentProcessor) addEnumArraySibling(
@@ -166,25 +182,25 @@ func (p *enrichmentProcessor) addEnumArraySibling(
 	attributeName string,
 	attrDef *schema.ItemAttributeDefinition,
 	siblingName string,
-) {
+) error {
 	if !p.enumSiblingsEnabled {
-		return
+		return nil
 	}
-	if _, present := eventvalue.Attribute(item, siblingName); present {
-		return
+	if item[siblingName] != nil {
+		return nil
 	}
 	values, ok := eventvalue.NewArrayView(value)
 	if !ok {
-		return
+		return nil
 	}
 	captions := make([]string, values.Len())
 	reportOtherAddition := false
 	for index := range values.Len() {
 		detail, lookupStatus := lookupEnumDefinition(context, attrDef, values.At(index))
 		if lookupStatus != enumLookupFound || detail.Caption == "" {
-			if !context.suppressesIssue(p.issueSuppression, issue.EnrichmentEnumSiblingNotAdded) {
+			if !context.ignoresIssue(issueEnrichmentEnumSiblingNotAddedMask) {
 				attributePath := context.path.String(pathstyle.ArrayIndexed)
-				context.addProcessorIssue(
+				return context.addProcessorIssue(
 					issue.SourceEnrichment,
 					issue.EnrichmentEnumSiblingNotAdded,
 					jsonish.Map{
@@ -196,7 +212,7 @@ func (p *enrichmentProcessor) addEnumArraySibling(
 						" was not added because an enum array value has no usable schema caption.",
 				)
 			}
-			return
+			return nil
 		}
 		captions[index] = detail.Caption
 		if enumArrayIsOther(context, attrDef, values, index) {
@@ -206,10 +222,10 @@ func (p *enrichmentProcessor) addEnumArraySibling(
 	item[siblingName] = captions
 	context.result.Enrichment.EnumSiblingsAdded++
 	if reportOtherAddition &&
-		!context.suppressesIssue(p.issueSuppression, issue.EnrichmentEnumSiblingOtherAdded) {
+		!context.ignoresIssue(issueEnrichmentEnumSiblingOtherAddedMask) {
 		enumPath := context.path.String(pathstyle.ArrayIndexed)
 		siblingPath := context.path.SiblingString(siblingName, pathstyle.ArrayIndexed)
-		context.addProcessorIssue(
+		return context.addProcessorIssue(
 			issue.SourceEnrichment,
 			issue.EnrichmentEnumSiblingOtherAdded,
 			jsonish.Map{
@@ -223,6 +239,7 @@ func (p *enrichmentProcessor) addEnumArraySibling(
 				" because no source-specific sibling value was present.",
 		)
 	}
+	return nil
 }
 
 func enumArrayIsOther(
@@ -249,26 +266,30 @@ func (p *enrichmentProcessor) addArrayValueObservables(
 	attributeName string,
 	attrDef *schema.ItemAttributeDefinition,
 	value any,
-) {
+) error {
 	values, ok := eventvalue.NewArrayView(value)
 	if !ok {
 		if _, observable := p.observableTypeID(context, attributeName, attrDef); observable &&
-			!context.suppressesIssue(p.issueSuppression, issue.EnrichmentObservableNotAddedWrongType) {
+			!context.ignoresIssue(issueEnrichmentObservableNotAddedWrongTypeMask) {
 			attributePath := context.path.String(pathstyle.ArrayIndexed)
-			context.addProcessorIssue(
+			return context.addProcessorIssue(
 				issue.SourceEnrichment,
 				issue.EnrichmentObservableNotAddedWrongType,
 				jsonish.Map{"attribute_path": attributePath, "attribute": attributeName},
 				"Observable was not added for "+strconv.Quote(attributePath)+" because its value is not an array.",
 			)
 		}
-		return
+		return nil
 	}
 	for index := range values.Len() {
 		context.path.PushArrayIndex(index)
-		p.addScalarValueObservable(context, attributeName, attrDef, values.At(index))
+		err := p.addScalarValueObservable(context, attributeName, attrDef, values.At(index))
 		context.path.Pop()
+		if err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (p *enrichmentProcessor) addScalarValueObservable(
@@ -276,15 +297,15 @@ func (p *enrichmentProcessor) addScalarValueObservable(
 	attributeName string,
 	attrDef *schema.ItemAttributeDefinition,
 	value any,
-) {
+) error {
 	typeID, present := p.observableTypeID(context, attributeName, attrDef)
 	if !present {
-		return
+		return nil
 	}
 	if context.compiled.TypeDerivedFrom(attrDef.Type, "json_t") {
-		if !context.suppressesIssue(p.issueSuppression, issue.EnrichmentObservableNotAddedJSONType) {
+		if !context.ignoresIssue(issueEnrichmentObservableNotAddedJSONTypeMask) {
 			attributePath := context.path.String(pathstyle.ArrayIndexed)
-			context.addProcessorIssue(
+			if err := context.addProcessorIssue(
 				issue.SourceEnrichment,
 				issue.EnrichmentObservableNotAddedJSONType,
 				jsonish.Map{
@@ -296,16 +317,18 @@ func (p *enrichmentProcessor) addScalarValueObservable(
 					strconv.Quote(attrDef.Type)+" has ambiguous scalar and"+
 					" structured value semantics and is not supported as an observable source."+
 					" If this use case is needed, file an issue at https://github.com/ocsf/ocsf-toolkit/issues.",
-			)
+			); err != nil {
+				return err
+			}
 		}
-		return
+		return nil
 	}
 	valueString, valueSupported := eventvalue.FormatScalar(value)
 	_, valueIsString := eventvalue.AsString(value)
 	if !valueSupported || valueString == "" && !valueIsString {
-		if !context.suppressesIssue(p.issueSuppression, issue.EnrichmentObservableNotAddedWrongType) {
+		if !context.ignoresIssue(issueEnrichmentObservableNotAddedWrongTypeMask) {
 			attributePath := context.path.String(pathstyle.ArrayIndexed)
-			context.addProcessorIssue(
+			if err := context.addProcessorIssue(
 				issue.SourceEnrichment,
 				issue.EnrichmentObservableNotAddedWrongType,
 				jsonish.Map{
@@ -314,11 +337,17 @@ func (p *enrichmentProcessor) addScalarValueObservable(
 				},
 				"Observable was not added for "+strconv.Quote(attributePath)+
 					" because its value is not a supported scalar.",
-			)
+			); err != nil {
+				return err
+			}
 		}
-		return
+		return nil
 	}
-	context.addObservable(&context.path, typeID, &valueString, p.pathNotation, p.enumSiblingsEnabled)
+	context.addObservable(
+		&context.path, typeID, &valueString, p.pathNotation, p.enumSiblingsEnabled,
+		p.deduplicateGenerated, p.reportObservableDuplicates,
+	)
+	return nil
 }
 
 func (p *enrichmentProcessor) observableTypeID(
@@ -356,25 +385,25 @@ func (p *enrichmentProcessor) addEnumSibling(
 	attributeName string,
 	attrDef *schema.ItemAttributeDefinition,
 	arrayIndex int,
-) {
+) error {
 	if !p.enumSiblingsEnabled || isArrayElement(arrayIndex) ||
 		!schema.AttributeActive(attrDef.ResolvedEnumSibling, context.activeProfiles) {
-		return
+		return nil
 	}
 	enumDetail, lookupStatus := lookupEnumDefinition(context, attrDef, value)
 	reportOtherAddition := false
 	siblingName := ""
 	if attrDef.Sibling != nil {
 		siblingName = *attrDef.Sibling
-		_, siblingPresent := eventvalue.Attribute(item, siblingName)
-		reportOtherAddition = !siblingPresent &&
+		siblingMissing := item[siblingName] == nil
+		reportOtherAddition = siblingMissing &&
 			attributeIsOtherEnumValue(value) &&
 			enumDetail != nil && enumDetail.Caption != ""
-		if !siblingPresent &&
+		if siblingMissing &&
 			(lookupStatus != enumLookupFound || enumDetail.Caption == "") &&
-			!context.suppressesIssue(p.issueSuppression, issue.EnrichmentEnumSiblingNotAdded) {
+			!context.ignoresIssue(issueEnrichmentEnumSiblingNotAddedMask) {
 			attributePath := context.path.String(pathstyle.ArrayIndexed)
-			context.addProcessorIssue(
+			if err := context.addProcessorIssue(
 				issue.SourceEnrichment,
 				issue.EnrichmentEnumSiblingNotAdded,
 				jsonish.Map{
@@ -384,14 +413,16 @@ func (p *enrichmentProcessor) addEnumSibling(
 				},
 				"Enum sibling "+strconv.Quote(siblingName)+
 					" was not added because the enum value has no usable schema caption.",
-			)
+			); err != nil {
+				return err
+			}
 		}
 	}
 	context.addEnumSibling(item, enumDetail, attrDef)
-	if reportOtherAddition && !context.suppressesIssue(p.issueSuppression, issue.EnrichmentEnumSiblingOtherAdded) {
+	if reportOtherAddition && !context.ignoresIssue(issueEnrichmentEnumSiblingOtherAddedMask) {
 		enumPath := context.path.String(pathstyle.ArrayIndexed)
 		siblingPath := context.path.SiblingString(siblingName, pathstyle.ArrayIndexed)
-		context.addProcessorIssue(
+		if err := context.addProcessorIssue(
 			issue.SourceEnrichment,
 			issue.EnrichmentEnumSiblingOtherAdded,
 			jsonish.Map{
@@ -403,8 +434,11 @@ func (p *enrichmentProcessor) addEnumSibling(
 			"Enum sibling "+strconv.Quote(siblingName)+" was added with caption "+
 				strconv.Quote(enumDetail.Caption)+" for enum ID 99"+
 				" because no source-specific sibling value was present.",
-		)
+		); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (p *enrichmentProcessor) onEventDone(context *processContext, event jsonish.Map) error {
@@ -412,20 +446,16 @@ func (p *enrichmentProcessor) onEventDone(context *processContext, event jsonish
 		return nil
 	}
 
-	existing, present := event["observables"]
-	if present && existing == nil {
-		delete(event, "observables")
-		present = false
-	}
-	if !present {
+	existing := event["observables"]
+	if existing == nil {
 		return p.addGeneratedObservables(context, event, nil)
 	}
 
 	existingObservables, ok := observable.NewCollection(existing)
 	if !ok {
 		if len(context.observables) > 0 &&
-			!context.suppressesIssue(p.issueSuppression, issue.EnrichmentObservablesNotAddedWrongType) {
-			context.addProcessorIssue(
+			!context.ignoresIssue(issueEnrichmentObservablesNotAddedWrongTypeMask) {
+			if err := context.addProcessorIssue(
 				issue.SourceEnrichment,
 				issue.EnrichmentObservablesNotAddedWrongType,
 				jsonish.Map{
@@ -434,7 +464,9 @@ func (p *enrichmentProcessor) onEventDone(context *processContext, event jsonish
 					"generated_observables": len(context.observables),
 				},
 				"Generated observables were not added because the event observables attribute is not an array.",
-			)
+			); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -450,43 +482,32 @@ func (p *enrichmentProcessor) addGeneratedObservables(
 	event jsonish.Map,
 	existing *observable.Collection,
 ) error {
-	if len(context.observables) == 0 {
+	if len(context.observables) == 0 && !p.reportObservableDuplicates {
 		return nil
 	}
-	if existing == nil && len(context.observables) == 1 {
-		event["observables"] = context.observables
-		context.result.Enrichment.ObservablesAdded = 1
-		context.generatedObservablesStart = 0
-		context.generatedObservablesPathNotation = p.pathNotation
-		return nil
-	}
-	deduplication := observable.DeduplicateGenerated(existing, context.observables)
-	for _, duplicate := range deduplication.Duplicates {
-		if context.suppressesIssue(p.issueSuppression, issue.EnrichmentObservableDuplicateSkipped) {
-			continue
+	generated := context.observables
+	if p.reportObservableDuplicates {
+		analysis := observable.AnalyzeDuplicates(existing, generated, p.deduplicateGenerated)
+		for _, duplicate := range analysis.Duplicates {
+			if err := p.reportObservableDuplicate(context, duplicate); err != nil {
+				return err
+			}
 		}
-		duplicateDescription := string(duplicate.Source)
-		if duplicate.Source == observable.DuplicateGenerated {
-			duplicateDescription = "earlier generated"
-		}
-		attributePath := context.observableDiagnosticPath(duplicate.GeneratedIndex, duplicate.Name, p.pathNotation)
-		context.addProcessorIssue(
-			issue.SourceEnrichment,
-			issue.EnrichmentObservableDuplicateSkipped,
-			jsonish.Map{
-				"attribute_path": attributePath,
-				"attribute":      terminalObservableAttribute(attributePath),
-				"duplicate_of":   string(duplicate.Source),
-			},
-			"Generated observable for path "+strconv.Quote(attributePath)+
-				" was skipped because it duplicates an "+duplicateDescription+" observable.",
-		)
+		generated = analysis.AcceptedGenerated
 	}
-	generated := deduplication.Accepted
+	return p.appendGeneratedObservables(context, event, existing, generated)
+}
 
+func (p *enrichmentProcessor) appendGeneratedObservables(
+	context *processContext,
+	event jsonish.Map,
+	existing *observable.Collection,
+	generated []jsonish.Map,
+) error {
 	if len(generated) == 0 {
 		return nil
 	}
+	generatedObservablesFirstIndex := 0
 	if existing == nil {
 		event["observables"] = generated
 	} else {
@@ -495,13 +516,39 @@ func (p *enrichmentProcessor) addGeneratedObservables(
 			return err
 		}
 		event["observables"] = appended
+		generatedObservablesFirstIndex = existing.Len()
 	}
 	context.result.Enrichment.ObservablesAdded += len(generated)
-	if existing != nil {
-		context.generatedObservablesStart = existing.Len()
-	}
-	context.generatedObservablesPathNotation = p.pathNotation
+	context.generatedObservablesFirstIndex = generatedObservablesFirstIndex
 	return nil
+}
+
+func (p *enrichmentProcessor) reportObservableDuplicate(
+	context *processContext,
+	duplicate observable.Duplicate,
+) error {
+	attributePath := "observables[" + strconv.Itoa(duplicate.Occurrence.Index) + "]"
+	attribute := "observables"
+	description := "Existing observable " + strconv.Itoa(duplicate.Occurrence.Index)
+	if duplicate.Occurrence.Origin == observable.ObservableOriginGenerated {
+		attributePath = context.observableDiagnosticPath(duplicate.Occurrence.Index, duplicate.Name, p.pathNotation)
+		attribute = terminalObservableAttribute(attributePath)
+		description = "Generated observable for path " + strconv.Quote(attributePath)
+	}
+	return context.addProcessorIssue(
+		issue.SourceEnrichment,
+		issue.ObservableDuplicate,
+		jsonish.Map{
+			"attribute_path":      attributePath,
+			"attribute":           attribute,
+			"observable_origin":   string(duplicate.Occurrence.Origin),
+			"observable_index":    duplicate.Occurrence.Index,
+			"duplicate_of_origin": string(duplicate.First.Origin),
+			"duplicate_of_index":  duplicate.First.Index,
+		},
+		description+" duplicates "+string(duplicate.First.Origin)+" observable "+
+			strconv.Itoa(duplicate.First.Index)+".",
+	)
 }
 
 // terminalObservableAttribute extracts the final attribute from a rendered observable path. It is used only while
@@ -526,7 +573,7 @@ func (c *processContext) addEnumSibling(
 		return
 	}
 	sibling := *attrDef.Sibling
-	if _, siblingPresent := eventvalue.Attribute(item, sibling); siblingPresent {
+	if item[sibling] != nil {
 		return
 	}
 	item[sibling] = enumDetail.CaptionValue()
@@ -541,12 +588,18 @@ func (c *processContext) addObservable(
 	value *string,
 	pathNotation pathstyle.Style,
 	enumSiblingsEnabled bool,
+	deduplicateGenerated bool,
+	reportObservableDuplicates bool,
 ) {
+	name := path.String(pathNotation)
+	if deduplicateGenerated && !reportObservableDuplicates &&
+		!c.generatedObservableIdentities.Add(name, observableTypeID, value) {
+		return
+	}
 	typeIDValue, present := c.compiled.ObservableTypeIDValue(observableTypeID)
 	if !present {
 		typeIDValue = observableTypeID
 	}
-	name := path.String(pathNotation)
 	observable := jsonish.Map{
 		"name":    name,
 		"type_id": typeIDValue,
@@ -559,31 +612,43 @@ func (c *processContext) addObservable(
 			observable["type"] = typeValue
 		}
 	}
-	c.addGeneratedObservable(path, observable, pathNotation)
+	c.addGeneratedObservable(path, observable, pathNotation, reportObservableDuplicates)
 }
 
 func (c *processContext) addGeneratedObservable(
 	path *eventpath.Path,
 	observable jsonish.Map,
 	style pathstyle.Style,
+	reportObservableDuplicates bool,
 ) {
 	index := len(c.observables)
 	c.observables = append(c.observables, observable)
+	if !reportObservableDuplicates {
+		return
+	}
 	if style == pathstyle.ArrayIndexed || style == pathstyle.JSONPath || !path.HasArrayIndex() {
-		if c.observableDiagnosticPaths != nil {
-			c.observableDiagnosticPaths = append(c.observableDiagnosticPaths, "")
+		if c.observableDiagnostics != nil {
+			c.observableDiagnostics.generatedIndexedPaths = append(
+				c.observableDiagnostics.generatedIndexedPaths, "",
+			)
 		}
 		return
 	}
-	if c.observableDiagnosticPaths == nil {
-		c.observableDiagnosticPaths = make([]string, index, index+1)
+	if c.observableDiagnostics == nil {
+		c.observableDiagnostics = &observableDiagnosticState{
+			generatedIndexedPaths: make([]string, index, index+1),
+		}
 	}
-	c.observableDiagnosticPaths = append(c.observableDiagnosticPaths, path.String(pathstyle.ArrayIndexed))
+	c.observableDiagnostics.generatedIndexedPaths = append(
+		c.observableDiagnostics.generatedIndexedPaths,
+		path.String(pathstyle.ArrayIndexed),
+	)
 }
 
 func (c *processContext) observableDiagnosticPath(index int, name string, style pathstyle.Style) string {
-	if index < len(c.observableDiagnosticPaths) && c.observableDiagnosticPaths[index] != "" {
-		return c.observableDiagnosticPaths[index]
+	if c.observableDiagnostics != nil && index < len(c.observableDiagnostics.generatedIndexedPaths) &&
+		c.observableDiagnostics.generatedIndexedPaths[index] != "" {
+		return c.observableDiagnostics.generatedIndexedPaths[index]
 	}
 	if style == pathstyle.JSONPath {
 		return strings.TrimPrefix(name, "$.")

@@ -22,9 +22,22 @@ var version = "dev"
 
 func runWithIO(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int {
 	parser, options := newParser()
-	err := parser.flags.Parse(args)
+	if requestsHelp(args) {
+		writeHelp(stdout, parser)
+		return 0
+	}
+	err := parser.parse(args)
 	remaining := parser.flags.Args()
 	return handleParseResult(err, remaining, parser, options, stdin, stdout, stderr)
+}
+
+func requestsHelp(args []string) bool {
+	for _, arg := range args {
+		if arg == "--help" || arg == "-h" {
+			return true
+		}
+	}
+	return false
 }
 
 func handleParseResult(
@@ -42,7 +55,7 @@ func handleParseResult(
 		return 2
 	}
 	if len(remaining) != 0 {
-		writef(stderr, "error: unexpected argument %q\n", remaining[0])
+		writef(stderr, "error: %s\n", unexpectedArgumentMessage(remaining[0]))
 		writeErrorUsage(stderr, parser)
 		return 2
 	}
@@ -68,8 +81,15 @@ func handleParseResult(
 		return 0
 	}
 
-	config, err := options.toConfig()
-	if err != nil {
+	config, problems := options.toConfig()
+	if len(problems) != 0 {
+		for _, problem := range problems {
+			writef(stderr, "error: %s\n", problem)
+		}
+		writeErrorUsage(stderr, parser)
+		return 2
+	}
+	if err := preflightSchemaFile(config.schemaPath); err != nil {
 		writef(stderr, "error: %s\n", err)
 		writeErrorUsage(stderr, parser)
 		return 2
@@ -81,6 +101,10 @@ func handleParseResult(
 	return exitCode
 }
 
+func unexpectedArgumentMessage(arg string) string {
+	return fmt.Sprintf("unexpected positional argument %q: did you forget to repeat an option?", arg)
+}
+
 func runProcessCommand(config processConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer) int {
 	destinations, err := buildProcessingDestinations(config)
 	if err != nil {
@@ -88,7 +112,7 @@ func runProcessCommand(config processConfig, stdin io.Reader, stdout io.Writer, 
 		return 1
 	}
 	outputs := newDestinationWriter(stdout, config.writeOptions())
-	pipeline, initializationIssues, suppressedInitializationIssues, err := newPipeline(config)
+	pipeline, initializationIssues, err := newPipeline(config)
 	if err != nil {
 		writef(stderr, "error: %s\n", err)
 		var configurationError *commandConfigurationError
@@ -99,18 +123,20 @@ func runProcessCommand(config processConfig, stdin io.Reader, stdout io.Writer, 
 	}
 	writeInitializationIssues(stderr, initializationIssues, helpOutputWidth(stderr))
 
-	summary, runtimeFailure, err := processEvents(
+	var summary *summaryReport
+	if destinations.summaryOutput != nil {
+		summary = newSummaryReport(config, initializationIssues)
+	}
+	hasValidationErrors, err := processEvents(
 		config,
 		pipeline,
-		initializationIssues,
-		suppressedInitializationIssues,
 		destinations,
 		stdin,
 		outputs,
+		summary,
 	)
 	if err != nil {
 		writef(stderr, "error: %s\n", err)
-		writePartialCompletion(stderr, config, summary)
 		var configurationError *commandConfigurationError
 		if errors.As(err, &configurationError) {
 			return 2
@@ -118,36 +144,26 @@ func runProcessCommand(config processConfig, stdin io.Reader, stdout io.Writer, 
 		return 1
 	}
 
-	if runtimeFailure {
-		writeFailureDetails(stderr, summary)
-		writePartialCompletion(stderr, config, summary)
-		return 1
-	}
-
-	if len(destinations.summaryFiles) > 0 || destinations.summaryJSONFile != nil {
-		report := buildSummaryReport(config, summary)
-		for _, summaryFile := range destinations.summaryFiles {
-			path := summaryFile.path.display
+	if summary != nil {
+		path := destinations.summaryOutput.path.display
+		if config.summaryFormat == summaryFormatJSON {
+			if err := outputs.writeJSON(path, summary); err != nil {
+				writef(stderr, "error: failed to write JSON summary %q: %s\n", path, err)
+				return 1
+			}
+		} else {
 			width := defaultHelpWidth
 			if path == stdioPath {
 				width = helpOutputWidth(stdout)
 			}
-			if err := outputs.writeText(path, humanSummaryWithMetadata(report, width)); err != nil {
+			if err := outputs.writeText(path, humanSummaryWithMetadata(*summary, width)); err != nil {
 				writef(stderr, "error: failed to write summary %q: %s\n", path, err)
-				return 1
-			}
-		}
-		if destinations.summaryJSONFile != nil {
-			path := destinations.summaryJSONFile.path.display
-			if err := outputs.writeJSON(path, report); err != nil {
-				writef(stderr, "error: failed to write JSON summary %q: %s\n", path, err)
 				return 1
 			}
 		}
 	}
 
-	if config.failOnValidationErrors &&
-		summary.EventsWithValidationErrorsOnly+summary.EventsWithValidationWarningsAndErrors > 0 {
+	if config.failOnValidationErrors && hasValidationErrors {
 		return 1
 	}
 	return 0
@@ -158,12 +174,6 @@ func writeInitializationIssues(w io.Writer, issues []schemaresult.Initialization
 		prefix := fmt.Sprintf("initialization issue %s: ", found.Code)
 		writef(w, "%s", prefix)
 		writeWrappedHanging(w, found.Message, len(prefix), helpEntryIndent, width)
-	}
-}
-
-func writePartialCompletion(w io.Writer, config processConfig, summary processSummary) {
-	if config.eventsDir != "" && summary.EventsProcessed > 0 {
-		writef(w, "Event files processed before error: %d\n", summary.EventsProcessed)
 	}
 }
 

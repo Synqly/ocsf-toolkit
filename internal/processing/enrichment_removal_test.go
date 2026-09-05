@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/ocsf/ocsf-toolkit/internal/schema"
 	"github.com/ocsf/ocsf-toolkit/issue"
 	"github.com/ocsf/ocsf-toolkit/jsonish"
 	"github.com/ocsf/ocsf-toolkit/pathstyle"
@@ -34,7 +35,7 @@ func TestEnumSiblingRetentionReasonsHaveStableStrings(t *testing.T) {
 
 func TestRecordEnumSiblingRetentionRejectsUnexpectedReason(t *testing.T) {
 	err := recordEnumSiblingRetention(
-		&processContext{}, nil, "mode_id", "mode", enumSiblingRetentionReasonCount, "", issueSuppression{},
+		&processContext{}, nil, "mode_id", "mode", enumSiblingRetentionReasonCount, "",
 	)
 	require.ErrorContains(t, err, "unexpected enum sibling retention reason")
 }
@@ -42,7 +43,7 @@ func TestRecordEnumSiblingRetentionRejectsUnexpectedReason(t *testing.T) {
 func TestEnrichmentRemovalSafelyRemovesScalarAndArrayEnumSiblings(t *testing.T) {
 	assert := require.New(t)
 	schema := makeValidationTestSchema(assert)
-	schema.compiled.Classes[int64(1)].Attributes["mode_id"].Enum["99"] = &enumDefinition{Caption: "Other"}
+	schema.Classes[int64(1)].Attributes["mode_id"].Enum["99"] = &enumDefinition{Caption: "Other"}
 
 	event := validValidationEvent()
 	event["class_name"] = "Alpha"
@@ -89,8 +90,8 @@ func TestEnrichmentRemovalRetainsStringEnumSibling(t *testing.T) {
 	assert := require.New(t)
 	schema := makeValidationTestSchema(assert)
 	siblingName := "state_name"
-	schema.compiled.Classes[int64(1)].Attributes["state"].Sibling = &siblingName
-	schema.compiled.Classes[int64(1)].Attributes[siblingName] = &itemAttributeDefinition{
+	schema.Classes[int64(1)].Attributes["state"].Sibling = &siblingName
+	schema.Classes[int64(1)].Attributes[siblingName] = &itemAttributeDefinition{
 		CommonAttributeDefinition: commonAttributeDefinition{Type: "string_t"},
 	}
 	event := validValidationEvent()
@@ -127,7 +128,7 @@ func TestEnrichmentSafeRemovalRetainsMismatchedIntegralEnumArraySibling(t *testi
 func TestEnrichmentForceRemovalRetainsIntegralEnumArraySiblingContainingOther(t *testing.T) {
 	assert := require.New(t)
 	schema := makeValidationTestSchema(assert)
-	schema.compiled.Classes[int64(1)].Attributes["status_ids"].Enum["99"] = &enumDefinition{Caption: "Other"}
+	schema.Classes[int64(1)].Attributes["status_ids"].Enum["99"] = &enumDefinition{Caption: "Other"}
 	event := validValidationEvent()
 	event["status_ids"] = []any{json.Number("1"), json.Number("99")}
 	event["statuses"] = []any{"Open", "Source-specific"}
@@ -145,7 +146,7 @@ func TestEnrichmentForceRemovalRetainsIntegralEnumArraySiblingContainingOther(t 
 func TestEnrichmentSafeRemovalRetainsIntegralEnumArraySiblingContainingOther(t *testing.T) {
 	assert := require.New(t)
 	schema := makeValidationTestSchema(assert)
-	schema.compiled.Classes[int64(1)].Attributes["status_ids"].Enum["99"] = &enumDefinition{Caption: "Other"}
+	schema.Classes[int64(1)].Attributes["status_ids"].Enum["99"] = &enumDefinition{Caption: "Other"}
 	event := validValidationEvent()
 	event["status_ids"] = []any{json.Number("1"), json.Number("99")}
 	event["statuses"] = []any{"Open", "Source-specific"}
@@ -199,7 +200,7 @@ func TestEnrichmentSafeRemovalRetainsEnumArraysWithDifferentLengths(t *testing.T
 func TestEnrichmentSafeRemovalRetainsStringEnumArraySibling(t *testing.T) {
 	assert := require.New(t)
 	schema := makeValidationTestSchema(assert)
-	statusIDs := schema.compiled.Classes[int64(1)].Attributes["status_ids"]
+	statusIDs := schema.Classes[int64(1)].Attributes["status_ids"]
 	statusIDs.Type = "string_t"
 	statusIDs.Enum = map[string]*enumDefinition{"99": {Caption: "Ninety-nine"}}
 	event := validValidationEvent()
@@ -231,9 +232,9 @@ func TestEnrichmentRemovalRemovesNullEnumSiblingRegardlessOfSupport(t *testing.T
 	assert.NoError(err)
 	assert.NotContains(event, "statuses", "a null sibling is equivalent to a missing one and is always removed")
 	assert.Equal(
-		3,
+		2,
 		result.EnrichmentRemoval.EnumSiblingsRemoved,
-		"class_name, activity_name, and the null (unsupported array) statuses are all removed",
+		"class_name and activity_name are removed; the logically absent statuses value is not counted",
 	)
 	assert.Zero(result.EnrichmentRemoval.EnumSiblingsRetained)
 	assert.Empty(result.Issues, "removing a null sibling is unconditional and does not need an issue")
@@ -316,14 +317,14 @@ func TestEnrichmentRemovalIssueUsesIndexedNestedPath(t *testing.T) {
 	schema := makeValidationTestSchema(assert)
 	addObservableArrayTestAttributes(schema)
 	modeSibling := "mode"
-	schema.compiled.Objects["ball"].Attributes["mode_id"] = &itemAttributeDefinition{
+	schema.Objects["ball"].Attributes["mode_id"] = &itemAttributeDefinition{
 		CommonAttributeDefinition: commonAttributeDefinition{
 			Type:    "integer_t",
 			Sibling: &modeSibling,
 			Enum:    map[string]*enumDefinition{"1": {Caption: "Known"}},
 		},
 	}
-	schema.compiled.Objects["ball"].Attributes["mode"] = &itemAttributeDefinition{
+	schema.Objects["ball"].Attributes["mode"] = &itemAttributeDefinition{
 		CommonAttributeDefinition: commonAttributeDefinition{Type: "string_t"},
 	}
 	event := validValidationEvent()
@@ -375,7 +376,7 @@ func TestEnrichmentRemovalForceRetainsEnumID99Sibling(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			assert := require.New(t)
 			schema := makeValidationTestSchema(assert)
-			schema.compiled.Classes[int64(1)].Attributes["mode_id"].Enum["99"] = &enumDefinition{Caption: "Other"}
+			schema.Classes[int64(1)].Attributes["mode_id"].Enum["99"] = &enumDefinition{Caption: "Other"}
 			event := validValidationEvent()
 			event["mode_id"] = json.Number("99")
 			event["mode"] = test.sibling
@@ -410,7 +411,7 @@ func TestEnrichmentRemovalTreatsNullAttributesAsMissing(t *testing.T) {
 
 		assert.NoError(err)
 		assert.NotContains(event, "mode")
-		assert.Equal(1, result.EnrichmentRemoval.EnumSiblingsRemoved)
+		assert.Zero(result.EnrichmentRemoval.EnumSiblingsRemoved)
 		assert.Zero(result.EnrichmentRemoval.EnumSiblingsRetained)
 	})
 
@@ -566,12 +567,13 @@ func TestEnrichmentRemovalMatchesObservableValuesAfterScalarStringConversion(t *
 	assert.Equal(1, result.EnrichmentRemoval.ObservablesRemoved)
 }
 
-func TestEnrichmentRemovalTreatsMissingObservablePathAsNull(t *testing.T) {
+func TestEnrichmentRemovalTreatsNullObservableValueAsOmitted(t *testing.T) {
 	assert := require.New(t)
 	schema := makeValidationTestSchema(assert)
 	event := validValidationEvent()
+	event["ball"] = jsonish.Map{"green": "go"}
 	event["observables"] = []any{
-		jsonish.Map{"name": "ball.green", "type_id": 1000, "value": nil},
+		jsonish.Map{"name": "ball", "type_id": 1000, "value": nil},
 	}
 
 	result, err := mustNewEventProcessorPipeline(
@@ -586,7 +588,7 @@ func TestEnrichmentRemovalTreatsMissingObservablePathAsNull(t *testing.T) {
 	assert.Empty(result.Issues)
 }
 
-func TestEnrichmentRemovalOmitsExplicitNullFromObservableIssueDetails(t *testing.T) {
+func TestEnrichmentRemovalTreatsNullObservableValueAtScalarPathAsValueless(t *testing.T) {
 	assert := require.New(t)
 	schema := makeValidationTestSchema(assert)
 	event := validValidationEvent()
@@ -604,9 +606,9 @@ func TestEnrichmentRemovalOmitsExplicitNullFromObservableIssueDetails(t *testing
 	assert.NoError(err)
 	assert.Contains(event, "observables")
 	assert.Equal(1, result.EnrichmentRemoval.ObservablesRetained)
-	issues := issuesWithCode(result.Issues, "issue_observable_value_not_found")
+	issues := issuesWithCode(result.Issues, "issue_observable_path_not_object")
 	assert.Len(issues, 1)
-	assert.Equal("observables[0].value", issues[0].Details["attribute_path"])
+	assert.Equal("observables[0].name", issues[0].Details["attribute_path"])
 	assert.NotContains(issues[0].Details, "value")
 }
 
@@ -644,10 +646,11 @@ func TestSafeEnrichmentRemovalStopsWithoutResolvedClass(t *testing.T) {
 	}
 }
 
-func TestValidationTreatsMissingObservablePathAsNull(t *testing.T) {
+func TestValidationTreatsNullObservableValueAsOmitted(t *testing.T) {
 	assert := require.New(t)
 	schema := makeValidationTestSchema(assert)
 	event := validValidationEvent()
+	event["ball"] = jsonish.Map{"green": "go"}
 	event["observables"] = []any{
 		jsonish.Map{"name": "ball.green", "type_id": json.Number("1000"), "value": nil},
 	}
@@ -655,17 +658,13 @@ func TestValidationTreatsMissingObservablePathAsNull(t *testing.T) {
 	result, err := mustNewEventProcessorPipeline(assert, schema, NewValidation()).ProcessEvent(event)
 
 	assert.NoError(err)
-	assert.NotContains(
+	assert.Contains(
 		issueCodes(findingsAtLevel(result.Validation.Findings, validation.LevelError)),
-		"validation_observable_path_not_found",
-	)
-	assert.NotContains(
-		issueCodes(findingsAtLevel(result.Validation.Findings, validation.LevelError)),
-		"validation_observable_value_not_found",
+		"validation_observable_path_not_object",
 	)
 }
 
-func TestEnrichmentRemovalTreatsMissingArrayBranchesAsNull(t *testing.T) {
+func TestEnrichmentRemovalTreatsNullObservableValuesAsValuelessAcrossArrayBranches(t *testing.T) {
 	assert := require.New(t)
 	schema := makeValidationTestSchema(assert)
 	addObservableArrayTestAttributes(schema)
@@ -686,9 +685,11 @@ func TestEnrichmentRemovalTreatsMissingArrayBranchesAsNull(t *testing.T) {
 	).ProcessEvent(event)
 
 	assert.NoError(err)
-	assert.NotContains(event, "observables")
-	assert.Equal(2, result.EnrichmentRemoval.ObservablesRemoved)
-	assert.Empty(result.Issues)
+	assert.Contains(event, "observables")
+	assert.Zero(result.EnrichmentRemoval.ObservablesRemoved)
+	assert.Equal(2, result.EnrichmentRemoval.ObservablesRetained)
+	assert.Len(issuesWithCode(result.Issues, "issue_observable_path_not_object"), 1)
+	assert.Len(issuesWithCode(result.Issues, "issue_observable_path_not_found"), 1)
 }
 
 func TestEnrichmentRemovalDoesNotTreatWrongTypeObservablePathAsNull(t *testing.T) {
@@ -1003,7 +1004,7 @@ func TestEnrichmentRemovalReportsMalformedObservables(t *testing.T) {
 		name       string
 		observable any
 		prepare    func(jsonish.Map)
-		wantCode   issue.IssueCode
+		wantCode   issue.Code
 	}{
 		{
 			name:       "attribute is not an array",
@@ -1318,17 +1319,17 @@ func TestEnrichmentRemovalForceRemovesEnumSiblingsBeforeObservablesAreAnalyzed(t
 	assert.Equal("observables[0].name", issues[0].Details["attribute_path"])
 }
 
-func addObservableArrayTestAttributes(schema *PipelineFactory) {
+func addObservableArrayTestAttributes(compiled *schema.Compiled) {
 	trueValue := true
 	ballType := "ball"
-	schema.compiled.Classes[int64(1)].Attributes["balls"] = &itemAttributeDefinition{
+	compiled.Classes[int64(1)].Attributes["balls"] = &itemAttributeDefinition{
 		CommonAttributeDefinition: commonAttributeDefinition{
 			Type:       "object_t",
 			ObjectType: &ballType,
 			IsArray:    &trueValue,
 		},
 	}
-	schema.compiled.Objects["ball"].Attributes["children"] = &itemAttributeDefinition{
+	compiled.Objects["ball"].Attributes["children"] = &itemAttributeDefinition{
 		CommonAttributeDefinition: commonAttributeDefinition{
 			Type:       "object_t",
 			ObjectType: &ballType,
